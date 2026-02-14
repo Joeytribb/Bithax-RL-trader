@@ -80,9 +80,9 @@ The model is evaluated using a rigorous "Out-of-Sample" backtesting framework.
 
 ## 5. Results & Interpretation
 
-### Training Progress
-![Training Reward Curve](results/tensorboard/reward_curve.png)
-*Figure 2: Mean episodic reward over 100M timesteps showing convergence behavior.*
+### Performance Profile
+![Agent Capability Profile](results/backtest_results/agent_profile_step_14100000.png)
+*Figure 2: Radar chart highlighting the agent's strengths in Risk-Adjusted Return (Sharpe) and Profit Efficiency.*
 
 *   **Compounded Return**: The agent achieved a **[INSERT %]** return over the test period, significantly outperforming the Buy-and-Hold benchmark.
 *   **Risk Profile**: The strategy demonstrated a Max Drawdown of **[INSERT %]**, compared to Bitcoin's native drawdown of >50%, proving its efficacy as a hedging or alpha-generation tool.
@@ -90,7 +90,7 @@ The model is evaluated using a rigorous "Out-of-Sample" backtesting framework.
 
 ## 6. Visualization
 
-![Backtest Animation](backtest_result/14mil-gif.gif)
+![Backtest Animation](results/backtest_results/14mil-gif.gif)
 
 *Figure 1: Animation of the agent's trading activity during a volatile period. Green triangles indicate Buy entries, Red triangles indicate Sell exits. Note the agent's ability to ride the trend while exiting before major reversals.*
 
