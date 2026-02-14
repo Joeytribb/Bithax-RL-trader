@@ -1,0 +1,404 @@
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
+import os
+from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+import torch
+
+def run_detailed_backtest(env, model, suffix="", check_improvement=False, previous_best=-np.inf):
+    """
+    Runs a backtest and captures exhaustive data for professional analytics.
+    Returns: (trades, net_worth)
+    """
+    obs, info = env.reset()
+    num_steps = len(env.df) - env.lookback_window
+    
+    agent_data = []
+    
+    device = model.device
+    
+    # for _ in tqdm(range(num_steps), desc="Backtesting"):
+    for _ in tqdm(range(num_steps), desc="Backtesting", disable=True):
+        # Get action probabilities for calibration analysis (kept for dashboard)
+        obs_tensor = torch.as_tensor(obs).unsqueeze(0).to(model.device)
+        with torch.no_grad():
+            dist = model.policy.get_distribution(obs_tensor)
+            probs = dist.distribution.probs.cpu().numpy()[0]
+            
+        action, _states = model.predict(obs, deterministic=True)
+        obs, reward, done, truncated, info = env.step(action)
+        
+        agent_data.append({
+            'step': env.current_step,
+            'action': action,
+            'probs': probs,
+            'net_worth': env.net_worth,
+            'price': env.close_prices[env.current_step]
+        })
+        
+        if done or truncated: break
+
+    if env.position_open:
+        exit_price = env.close_prices[env.current_step]
+        position_value = env.last_balance * (exit_price / env.entry_price)
+        sell_fee = position_value * env.transaction_fee_percent
+        env.balance = position_value - sell_fee
+        env.net_worth = env.balance
+        net_profit = env.balance - env.last_balance
+        net_profit_percent = (net_profit / env.last_balance) * 100 if env.last_balance > 0 else 0
+        trade = {'entry_step': env.entry_step, 'exit_step': env.current_step,
+                 'entry_price': env.entry_price, 'exit_price': exit_price, 'profit_%': net_profit_percent}
+        env.trades.append(trade)
+
+    # Conditional Saving Logic
+    if check_improvement:
+        if env.net_worth <= previous_best:
+            # Not an improvement, skip reporting
+            return env.trades, env.net_worth
+
+    analyzer = PerformanceAnalyzer(env, agent_data, suffix=suffix)
+    analyzer.generate_report()
+    
+    return env.trades, env.net_worth
+
+def plot_trades(df, trades):
+    """Generates an interactive Plotly chart of the trades."""
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['upper_band'], mode='lines', line=dict(color='rgba(173, 204, 255, 0.5)'), name='Upper Band'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['middle_band'], mode='lines', line=dict(color='rgba(255, 229, 153, 0.5)'), name='Middle Band'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['lower_band'], mode='lines', line=dict(color='rgba(173, 204, 255, 0.5)'), name='Lower Band', fill='tonexty'))
+
+    if trades:
+        trades_df = pd.DataFrame(trades)
+        if not trades_df.empty:
+            buy_indices = [i for i in trades_df['entry_step'] if i < len(df)]
+            sell_indices = [i for i in trades_df['exit_step'] if i < len(df)]
+            buy_signals = df.iloc[buy_indices]
+            sell_signals = df.iloc[sell_indices]
+            fig.add_trace(go.Scatter(x=buy_signals.index, y=buy_signals['Low'] * 0.98, mode='markers', marker=dict(symbol='triangle-up', color='lime', size=10), name='Buy Signal'))
+            fig.add_trace(go.Scatter(x=sell_signals.index, y=sell_signals['High'] * 1.02, mode='markers', marker=dict(symbol='triangle-down', color='red', size=10), name='Sell Signal'))
+        
+    fig.update_layout(title='Bitcoin Trading Bot Backtest: The Champion Model',
+                      xaxis_title='Date', yaxis_title='Price (USD)', xaxis_rangeslider_visible=False, template='plotly_dark')
+    fig.show()
+
+def generate_tradingview_script(df, trades, filename="tradingview_strategy.pine"):
+    """
+    Generates a Pine Script™ file to visualize trades in TradingView.
+    """
+    if not trades:
+        print("No trades to generate script for.")
+        return
+
+    trades_df = pd.DataFrame(trades)
+    buy_times = df.index[trades_df['entry_step']].tolist()
+    sell_times = df.index[trades_df['exit_step']].tolist()
+
+    buy_timestamps_ms = [int(t.timestamp() * 1000) for t in buy_times]
+    sell_timestamps_ms = [int(t.timestamp() * 1000) for t in sell_times]
+
+    pine_script_content = f"""
+//@version=5
+strategy("RL Agent Backtest", overlay=true, initial_capital={trades_df.iloc[0].get('initial_balance', 10000)}, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.05)
+
+var long_signals = array.from({', '.join(map(str, buy_timestamps_ms))})
+var exit_signals = array.from({', '.join(map(str, sell_timestamps_ms))})
+
+is_long_signal = array.includes(long_signals, time)
+is_exit_signal = array.includes(exit_signals, time)
+
+if (is_long_signal)
+    strategy.entry("Long", strategy.long)
+if (is_exit_signal)
+    strategy.close("Long", comment="Exit")
+
+plotshape(series=is_long_signal, title="Buy Signal", location=location.belowbar, color=color.new(color.green, 0), style=shape.labelup, text="BUY", textcolor=color.new(color.white, 0), size=size.small)
+plotshape(series=is_exit_signal, title="Sell Signal", location=location.abovebar, color=color.new(color.red, 0), style=shape.labeldown, text="SELL", textcolor=color.new(color.white, 0), size=size.small)
+"""
+
+    with open(filename, "w") as f:
+        f.write(pine_script_content)
+    # print(f"\nSuccessfully generated TradingView Pine Script: '{filename}'")
+    # print("  Instructions: Copy the content of this file into the TradingView Pine Editor.")
+
+class PerformanceAnalyzer:
+    def __init__(self, env, agent_data, suffix=""):
+        self.env = env
+        self.df = env.df
+        self.trades = env.trades
+        self.agent_data = pd.DataFrame(agent_data)
+        self.suffix = f"_{suffix}" if suffix else ""
+        self.output_dir = "results/backtest_results" # Updated path
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+        
+        self.history = pd.DataFrame(env.history).set_index('step')
+        self.history.index = self.df.index[self.history.index]
+        
+        # Calculate Benchmark (Buy & Hold)
+        self.history['benchmark_price'] = self.df['Close'].loc[self.history.index]
+        self.history['benchmark_net_worth'] = self.env.initial_balance * (self.history['benchmark_price'] / self.history['benchmark_price'].iloc[0])
+        
+        # Calculate 5x Leverage Simulation
+        self.history['returns'] = self.history['net_worth'].pct_change().fillna(0)
+        self.history['leverage_5x_nw'] = self.env.initial_balance * (1 + self.history['returns'] * 5).cumprod()
+
+    def calculate_metrics(self):
+        rets = self.history['returns']
+        trading_periods = 24 * 365
+        
+        # Sharpe Ratio
+        sharpe = (rets.mean() / rets.std()) * np.sqrt(trading_periods) if rets.std() > 0 else 0
+        
+        # Sortino Ratio (Downside deviation)
+        downside_std = rets[rets < 0].std()
+        sortino = (rets.mean() / downside_std) * np.sqrt(trading_periods) if downside_std > 0 else 0
+        
+        rolling_sharpe = rets.rolling(window=24*30).apply(lambda x: (x.mean() / x.std()) * np.sqrt(trading_periods) if x.std() > 0 else 0)
+        
+        self.history['cum_max'] = self.history['net_worth'].cummax()
+        self.history['drawdown'] = (self.history['net_worth'] - self.history['cum_max']) / self.history['cum_max']
+        max_dd = self.history['drawdown'].min()
+        
+        # Calmar Ratio
+        calmar = (rets.mean() * trading_periods) / abs(max_dd) if max_dd != 0 else 0
+        
+        return {
+            'sharpe': sharpe,
+            'sortino': sortino,
+            'calmar': calmar,
+            'max_dd': max_dd,
+            'rolling_sharpe': rolling_sharpe
+        }
+
+    def generate_report(self):
+        metrics = self.calculate_metrics()
+        
+        report_lines = []
+        report_lines.append("\n" + "="*80)
+        report_lines.append(" " * 25 + "ADVANCED RESEARCH PERFORMANCE REPORT")
+        report_lines.append("="*80)
+        report_lines.append(f"Final Net Worth:         ${self.env.net_worth:,.2f}")
+        report_lines.append(f"Total Strategy Return:   {((self.env.net_worth - self.env.initial_balance) / self.env.initial_balance * 100):.2f}%")
+        report_lines.append(f"Benchmark (B&H) Return:  {((self.history['benchmark_net_worth'].iloc[-1] - self.env.initial_balance) / self.env.initial_balance * 100):.2f}%")
+        report_lines.append("-" * 80)
+        report_lines.append(f"Annualized Sharpe:       {metrics['sharpe']:.2f}")
+        report_lines.append(f"Annualized Sortino:      {metrics['sortino']:.2f}")
+        report_lines.append(f"Calmar Ratio:            {metrics['calmar']:.2f}")
+        report_lines.append(f"Max Drawdown:            {metrics['max_dd']*100:.2f}%")
+        
+        if self.trades:
+            trades_df = pd.DataFrame(self.trades)
+            wins = trades_df[trades_df['profit_%'] > 0]
+            report_lines.append("-" * 80)
+            report_lines.append(f"Total Trades:            {len(trades_df)}")
+            report_lines.append(f"Win Rate:                {(len(wins) / len(trades_df) * 100):.2f}%")
+            report_lines.append(f"Profit Factor:           {(wins['profit_%'].sum() / abs(trades_df[trades_df['profit_%'] <= 0]['profit_%'].sum())):.2f}")
+            
+            report_lines.append("\n" + "-"*35 + " TRADE BREAKDOWN " + "-"*35)
+            report_lines.append(trades_df[['entry_step', 'exit_step', 'profit_%']].sort_values(by='profit_%', ascending=False).head(5).to_string(index=False))
+            report_lines.append("...")
+            report_lines.append(trades_df[['entry_step', 'exit_step', 'profit_%']].sort_values(by='profit_%', ascending=False).tail(5).to_string(index=False))
+        
+        report_lines.append("="*80)
+        
+        report_content = "\n".join(report_lines)
+        # print(report_content)
+        
+        report_path = os.path.join(self.output_dir, f"performance_report{self.suffix}.txt")
+        with open(report_path, "w") as f:
+            f.write(report_content)
+        # tqdm.write(f"[SUCCESS] Text Report saved: '{report_path}'")
+
+        self.create_visual_dashboard(metrics)
+        self.save_agent_profile_image(metrics)
+
+    def save_agent_profile_image(self, metrics):
+        """Generates a high-resolution summary image for portfolios."""
+        categories = ['Return Intensity', 'Risk-Adjusted (Sharpe)', 'Downside Risk (Sortino)', 'Robustness (Inv. DD)', 'Win Consistency', 'Profit Efficiency']
+        
+        # Recalculate scores for radar
+        ret_val = (self.env.net_worth - self.env.initial_balance) / self.env.initial_balance
+        score_return = min(max(ret_val / 0.5, 0), 1)
+        score_sharpe = min(max(metrics['sharpe'] / 3.0, 0), 1)
+        score_sortino = min(max(metrics['sortino'] / 3.0, 0), 1)
+        score_drawdown = 1.0 - min(abs(metrics['max_dd']) / 0.5, 1)
+        
+        trades_df = pd.DataFrame(self.trades) if self.trades else None
+        if trades_df is not None:
+            win_rate = len(trades_df[trades_df['profit_%'] > 0]) / len(trades_df)
+            score_win_rate = min(max((win_rate - 0.45) / 0.15, 0), 1)
+            profit_factor = trades_df[trades_df['profit_%'] > 0]['profit_%'].sum() / abs(trades_df[trades_df['profit_%'] <= 0]['profit_%'].sum())
+            score_profit_factor = min(max((profit_factor - 1.0) / 0.5, 0), 1)
+        else:
+            win_rate, profit_factor = 0, 0
+            score_win_rate, score_profit_factor = 0, 0
+
+        values = [score_return, score_sharpe, score_sortino, score_drawdown, score_win_rate, score_profit_factor]
+        N = len(categories)
+        angles = [n / float(N) * 2 * np.pi for n in range(N)]
+        values += values[:1]
+        angles += angles[:1]
+
+        fig, ax = plt.subplots(figsize=(10, 8), subplot_kw=dict(polar=True))
+        plt.style.use('dark_background')
+        ax.set_facecolor('#1e1e1e')
+        fig.patch.set_facecolor('#1e1e1e')
+
+        plt.xticks(angles[:-1], categories, color='cyan', size=10)
+        ax.plot(angles, values, linewidth=2, linestyle='solid', color='cyan')
+        ax.fill(angles, values, 'cyan', alpha=0.3)
+        ax.set_ylim(0, 1)
+        
+        title_str = "Agent Capability Profile: PhD Portfolio Summary"
+        plt.title(title_str, size=16, color='white', y=1.1)
+        
+        # Add summary text Box
+        textstr = '\n'.join((
+            f"Strategy: PPO Reinforcement Learning",
+            f"Total Return: {(ret_val*100):.2f}%",
+            f"Sharpe Ratio: {metrics['sharpe']:.2f}",
+            f"Max Drawdown: {(metrics['max_dd']*100):.2f}%",
+            f"Win Rate: {(win_rate*100):.2f}%",
+            f"Profit Factor: {profit_factor:.2f}"
+        ))
+        
+        props = dict(boxstyle='round', facecolor='indigo', alpha=0.5)
+        ax.text(1.3, 1.1, textstr, transform=ax.transAxes, fontsize=12,
+                verticalalignment='top', bbox=props, color='white')
+
+        profile_path = os.path.join(self.output_dir, f"agent_profile{self.suffix}.png")
+        plt.savefig(profile_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        # tqdm.write(f"[SUCCESS] Summary Profile Image saved: '{profile_path}'")
+
+    def create_visual_dashboard(self, metrics):
+        # Calculate scores for Radar Chart (Normalized 0-1)
+        # Returns: 100% Return -> 1.0 (Log scale for better visualization)
+        ret_val = (self.env.net_worth - self.env.initial_balance) / self.env.initial_balance
+        score_return = min(max(ret_val / 0.5, 0), 1) # 50% is 'full'
+        score_sharpe = min(max(metrics['sharpe'] / 3.0, 0), 1) # 3.0 is institutional grade
+        score_sortino = min(max(metrics['sortino'] / 3.0, 0), 1)
+        score_drawdown = 1.0 - min(abs(metrics['max_dd']) / 0.5, 1) # 50% DD is 'empty'
+        
+        trades_df = pd.DataFrame(self.trades) if self.trades else None
+        if trades_df is not None:
+            win_rate = len(trades_df[trades_df['profit_%'] > 0]) / len(trades_df)
+            score_win_rate = min(max((win_rate - 0.45) / 0.15, 0), 1) # 45% to 60% range
+            profit_factor = trades_df[trades_df['profit_%'] > 0]['profit_%'].sum() / abs(trades_df[trades_df['profit_%'] <= 0]['profit_%'].sum())
+            score_profit_factor = min(max((profit_factor - 1.0) / 0.5, 0), 1) # 1.0 to 1.5 range
+        else:
+            score_win_rate = 0
+            score_profit_factor = 0
+
+        # Create Layout
+        fig = make_subplots(
+            rows=6, cols=2,
+            subplot_titles=(
+                "Agent Ability Profile (Radar)", "Strategic Summary Stats",
+                "Equity Curve vs Benchmark", "Drawdown Profile (%)",
+                "Daily Returns Distribution", "Rolling Sharpe Ratio (30D)",
+                "Action vs Next-Bar Reality (Confusion)", "Model Confidence Calibration",
+                "1x vs 5x Leverage Stress Test", "Trade Profit Distribution",
+                "Cumulative Return %", "Consistency Analysis (Rolling PnL)"
+            ),
+            vertical_spacing=0.06,
+            specs=[[{"type": "polar"}, {"type": "table"}], 
+                   [{"secondary_y": True}, {}], 
+                   [{}, {}], 
+                   [{}, {}], 
+                   [{}, {}], 
+                   [{}, {}]]
+        )
+
+        # 0. Radar Chart
+        fig.add_trace(go.Scatterpolar(
+            r=[score_return, score_sharpe, score_sortino, score_drawdown, score_win_rate, score_profit_factor],
+            theta=['Return Intensity', 'Risk-Adjusted (Sharpe)', 'Downside Risk (Sortino)', 'Robustness (Inv. DD)', 'Win Consistency', 'Profit Efficiency'],
+            fill='toself',
+            name='Agent Capability',
+            line_color='cyan'
+        ), row=1, col=1)
+
+        # 0. Summary Table
+        summary_stats = [
+            ['Methodology', 'PPO Reinforcement Learning'],
+            ['Timeframe', '1-Hour (H1) BTC/USD'],
+            ['Total Return', f"{(ret_val*100):.2f}%"],
+            ['Sharpe Ratio', f"{metrics['sharpe']:.2f}"],
+            ['Max Drawdown', f"{(metrics['max_dd']*100):.2f}%"],
+            ['Profit Factor', f"{profit_factor:.2f}" if trades_df is not None else "N/A"],
+            ['Win Rate', f"{(win_rate*100):.2f}%" if trades_df is not None else "N/A"]
+        ]
+        fig.add_trace(go.Table(
+            header=dict(values=['Dimension', 'Metric'], fill_color='indigo', align='left', font=dict(color='white', size=12)),
+            cells=dict(values=[[s[0] for s in summary_stats], [s[1] for s in summary_stats]], fill_color='darkslateblue', align='left', font=dict(color='white', size=11))
+        ), row=1, col=2)
+
+        # 1. Equity Curve
+        fig.add_trace(go.Scatter(x=self.history.index, y=self.history['net_worth'], name="Strategy (1x)", line=dict(color='cyan', width=2)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=self.history.index, y=self.history['benchmark_net_worth'], name="Benchmark (B&H)", line=dict(color='gray', dash='dash')), row=2, col=1)
+
+        # 2. Drawdown
+        fig.add_trace(go.Scatter(x=self.history.index, y=self.history['drawdown']*100, fill='tozeroy', name="Drawdown %", line=dict(color='rgba(255, 0, 0, 0.5)')), row=2, col=2)
+        # Highlight Max Drawdown
+        max_dd_idx = self.history['drawdown'].idxmin()
+        fig.add_trace(go.Scatter(x=[max_dd_idx], y=[self.history['drawdown'].min()*100], mode='markers', marker=dict(color='yellow', size=12, symbol='x'), name="Max DD"), row=2, col=2)
+
+        # 3. Returns Distribution
+        daily_rets = self.history['returns'].resample('D').sum()
+        fig.add_trace(go.Histogram(x=daily_rets, name="Daily Returns", marker_color='royalblue', opacity=0.7, nbinsx=50), row=3, col=1)
+
+        # 4. Rolling Sharpe
+        fig.add_trace(go.Scatter(x=self.history.index, y=metrics['rolling_sharpe'], name="Rolling Sharpe", line=dict(color='orange')), row=3, col=2)
+
+        # 5. Confusion Matrix
+        # Define Ground Truth: 1=Next bar up, 2=Next bar down, 0=Flat
+        self.agent_data['next_ret'] = self.agent_data['price'].pct_change().shift(-1)
+        self.agent_data['truth'] = self.agent_data['next_ret'].apply(lambda x: 1 if x > 0.0001 else (2 if x < -0.0001 else 0))
+        
+        # Clean data for Confusion Matrix to avoid "unknown targets" error
+        cm_df = self.agent_data[['truth', 'action']].dropna()
+        y_true = cm_df['truth'].astype(int)
+        y_pred = cm_df['action'].astype(int)
+        
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
+        # Normalize CM for better visualization
+        cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        fig.add_trace(go.Heatmap(z=cm_norm, x=['Hold', 'Buy', 'Sell'], y=['Reality: Flat', 'Reality: Up', 'Reality: Down'], colorscale='Plasma', name="CM"), row=4, col=1)
+
+        # 6. Confidence Calibration (Box plot per action)
+        self.agent_data['conf'] = self.agent_data['probs'].apply(lambda x: np.max(x))
+        for act, label in zip([0, 1, 2], ['Hold', 'Buy', 'Sell']):
+            act_data = self.agent_data[self.agent_data['action'] == act]
+            fig.add_trace(go.Box(y=act_data['conf'], name=label, boxpoints='outliers'), row=4, col=2)
+
+        # 7. Leverage Comparison
+        fig.add_trace(go.Scatter(x=self.history.index, y=self.history['net_worth'], name="1x NW", line=dict(color='cyan')), row=5, col=1)
+        fig.add_trace(go.Scatter(x=self.history.index, y=self.history['leverage_5x_nw'], name="5x NW", line=dict(color='rgba(255, 0, 255, 0.4)')), row=5, col=1)
+
+        # 8. Trade Profit Distribution
+        if self.trades:
+            profit_data = [t['profit_%'] for t in self.trades]
+            fig.add_trace(go.Box(x=profit_data, name="Trade PnL %", marker_color='lime'), row=5, col=2)
+
+        # 9. Cumulative Return %
+        cum_pnl = (self.history['net_worth'] / self.env.initial_balance - 1) * 100
+        fig.add_trace(go.Scatter(x=self.history.index, y=cum_pnl, name="Cum PnL %", line=dict(color='lime')), row=6, col=1)
+
+        # 10. Rolling Win Rate (Moving average of profitability)
+        if self.trades:
+            trades_df['win'] = (trades_df['profit_%'] > 0).astype(int)
+            trades_df['rolling_win_rate'] = trades_df['win'].rolling(window=10).mean()
+            # Map steps back to dates for plotting
+            trades_df['exit_date'] = self.df.index[trades_df['exit_step']]
+            fig.add_trace(go.Scatter(x=trades_df['exit_date'], y=trades_df['rolling_win_rate'], name="Win Rate (10-Trade MA)", line=dict(color='gold')), row=6, col=2)
+
+        fig.update_layout(height=2200, width=1200, title_text=f"Bitcoin RL Trading: Step {self.suffix.replace('_', '')} Portfolio", template="plotly_dark", showlegend=True)
+        dashboard_path = os.path.join(self.output_dir, f"performance_dashboard{self.suffix}.html")
+        fig.write_html(dashboard_path)
+        # tqdm.write(f"[SUCCESS] Advanced Dashboard generated: '{dashboard_path}'")

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+
+# Data (Never commit large datasets)
+data/raw/*.csv
+data/processed/*.csv
+data/*.csv
+*.zip
+
+# Models (Optional: Commit only final champion if <100MB, otherwise use DVC or Git LFS)
+models/*.zip
+ppo_trading_bot_*.zip
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs and Results
+results/tensorboard/
+results/backtest_results/*.txt
+# Keep specific showcase files if small, otherwise ignore
+!results/backtest_results/14mil-gif.gif
